@@ -1,0 +1,11 @@
+[server]
+host = "127.0.0.1"
+port = 8418
+
+[guard]
+min_age_days = 5
+check_vulns = true
+
+[paths]
+allowlist = "~/.config/pkg-guard/allowlist.txt"
+log = "~/.local/share/pkg-guard/guard.log"

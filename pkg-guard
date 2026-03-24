@@ -1,0 +1,1062 @@
+#!/usr/bin/env python3
+"""
+pkg-guard: Local registry proxy that blocks too-young package versions.
+
+Sits between pip/uv/npm and upstream registries, filtering out package
+versions published fewer than N days ago. Supports vuln bypass via OSV.dev
+and a package allowlist.
+
+Usage:
+    pkg-guard serve          Run the proxy server (foreground)
+    pkg-guard start          Install and start launchd agent
+    pkg-guard stop           Stop and uninstall launchd agent
+    pkg-guard status         Show proxy status and config
+    pkg-guard allow <pkg>    Add package to allowlist
+    pkg-guard deny <pkg>     Remove package from allowlist
+    pkg-guard log            Tail the log file
+    pkg-guard check <pkg>    Check a PyPI package's age
+    pkg-guard setup          Configure pip/uv/npm to use the proxy
+    pkg-guard unsetup        Remove proxy config from pip/uv/npm
+"""
+
+import argparse
+import datetime
+import html
+import json
+import logging
+import os
+import pathlib
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG = {
+    "server": {"host": "127.0.0.1", "port": 8418},
+    "guard": {"min_age_days": 5, "check_vulns": True},
+    "paths": {
+        "allowlist": "~/.config/pkg-guard/allowlist.txt",
+        "log": "~/.local/share/pkg-guard/guard.log",
+    },
+}
+
+CONFIG_PATH = pathlib.Path("~/.config/pkg-guard/config.toml").expanduser()
+
+
+def load_config() -> dict:
+    """Load config from TOML, falling back to defaults."""
+    cfg = DEFAULT_CONFIG.copy()
+    if CONFIG_PATH.exists():
+        try:
+            import tomllib
+
+            with open(CONFIG_PATH, "rb") as f:
+                user_cfg = tomllib.load(f)
+            for section in cfg:
+                if section in user_cfg:
+                    cfg[section].update(user_cfg[section])
+        except Exception:
+            pass
+    # Expand ~ in paths
+    for key in cfg["paths"]:
+        cfg["paths"][key] = os.path.expanduser(cfg["paths"][key])
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Allowlist
+# ---------------------------------------------------------------------------
+
+
+class Allowlist:
+    def __init__(self, path: str):
+        self.path = pathlib.Path(path)
+        self._entries: set[str] = set()
+        self._load()
+
+    def _load(self):
+        if self.path.exists():
+            self._entries = {
+                line.strip()
+                for line in self.path.read_text().splitlines()
+                if line.strip()
+            }
+
+    def __contains__(self, pkg: str) -> bool:
+        return pkg.lower() in {e.lower() for e in self._entries}
+
+    def add(self, pkg: str):
+        self._entries.add(pkg)
+        self._save()
+
+    def remove(self, pkg: str):
+        self._entries = {e for e in self._entries if e.lower() != pkg.lower()}
+        self._save()
+
+    def _save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("\n".join(sorted(self._entries)) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# OSV.dev vulnerability check
+# ---------------------------------------------------------------------------
+
+
+def check_osv_vulns(pkg: str, version: str, ecosystem: str) -> list[str]:
+    """Query OSV.dev for known vulns. Returns list of vuln IDs."""
+    try:
+        data = json.dumps(
+            {
+                "version": version,
+                "package": {"name": pkg, "ecosystem": ecosystem},
+            }
+        ).encode()
+        req = urllib.request.Request(
+            "https://api.osv.dev/v1/query",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read())
+        return [v["id"] for v in result.get("vulns", [])]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Response cache
+# ---------------------------------------------------------------------------
+
+
+class Cache:
+    """Simple in-memory cache with TTL."""
+
+    def __init__(self, ttl_seconds: int = 600):
+        self.ttl = ttl_seconds
+        self._data: dict[str, tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Any | None:
+        with self._lock:
+            if key in self._data:
+                ts, val = self._data[key]
+                if time.time() - ts < self.ttl:
+                    return val
+                del self._data[key]
+        return None
+
+    def set(self, key: str, val: Any):
+        with self._lock:
+            self._data[key] = (time.time(), val)
+
+
+# ---------------------------------------------------------------------------
+# Vuln bypass cache
+# ---------------------------------------------------------------------------
+
+
+class VulnBypassCache:
+    """Tracks packages temporarily allowed through due to vuln in fallback."""
+
+    def __init__(self, ttl_seconds: int = 3600):
+        self.ttl = ttl_seconds
+        self._bypassed: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str):
+        with self._lock:
+            self._bypassed[key] = time.time()
+
+    def is_allowed(self, key: str) -> bool:
+        with self._lock:
+            if key in self._bypassed:
+                if time.time() - self._bypassed[key] < self.ttl:
+                    return True
+                del self._bypassed[key]
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Age filtering helpers
+# ---------------------------------------------------------------------------
+
+
+def parse_iso_time(ts: str) -> datetime.datetime | None:
+    if not ts:
+        return None
+    ts = ts.replace("Z", "+00:00")
+    try:
+        return datetime.datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+
+def version_age_days(upload_time: str) -> int:
+    """Return age in days, or -1 if unparseable."""
+    dt = parse_iso_time(upload_time)
+    if dt is None:
+        return -1
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return (now - dt).days
+
+
+def version_sort_key(v: str) -> tuple:
+    """Extract numeric parts for version comparison."""
+    parts = re.findall(r"\d+", v)
+    return tuple(int(p) for p in parts)
+
+
+def is_prerelease(v: str) -> bool:
+    return bool(re.search(r"(a|b|rc|dev|alpha|beta|pre|canary|next)", v, re.I))
+
+
+def normalize_pypi_name(name: str) -> str:
+    """PEP 503 normalization."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def extract_version_from_filename(filename: str, pkg_normalized: str) -> str | None:
+    """Extract version from a PyPI filename like 'requests-2.32.5.tar.gz'."""
+    # Normalize hyphens/underscores in the filename prefix
+    prefix_pattern = re.sub(r"[-_]+", "[-_]+", re.escape(pkg_normalized))
+    m = re.match(
+        prefix_pattern + r"-(\d+(?:\.\d+)*(?:(?:a|b|rc|dev|post|pre|alpha|beta)\d*)?)",
+        filename,
+        re.I,
+    )
+    return m.group(1) if m else None
+
+
+# ---------------------------------------------------------------------------
+# Upstream fetchers
+# ---------------------------------------------------------------------------
+
+
+def fetch_url(url: str, headers: dict | None = None, timeout: int = 15) -> tuple[bytes, dict]:
+    """Fetch a URL, return (body, response_headers)."""
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(), dict(resp.headers)
+
+
+# ---------------------------------------------------------------------------
+# PyPI handler
+# ---------------------------------------------------------------------------
+
+
+def handle_pypi_simple(
+    package: str,
+    accept_header: str,
+    cfg: dict,
+    allowlist: Allowlist,
+    cache: Cache,
+    vuln_bypass: VulnBypassCache,
+    guard_log: logging.Logger,
+) -> tuple[bytes, str, int]:
+    """
+    Proxy a PyPI Simple API request.
+    Returns (body, content_type, status_code).
+    """
+    pkg_normalized = normalize_pypi_name(package)
+    min_age = cfg["guard"]["min_age_days"]
+
+    if pkg_normalized in allowlist:
+        guard_log.info("ALLOWLIST pypi %s", pkg_normalized)
+        # Pass through unmodified
+        return _fetch_pypi_passthrough(pkg_normalized, accept_header)
+
+    # Always fetch JSON from upstream for filtering
+    cache_key = f"pypi:{pkg_normalized}"
+    upstream_data = cache.get(cache_key)
+    if upstream_data is None:
+        url = f"https://pypi.org/simple/{pkg_normalized}/"
+        try:
+            body, _ = fetch_url(
+                url,
+                headers={
+                    "Accept": "application/vnd.pypi.simple.v1+json",
+                },
+            )
+            upstream_data = json.loads(body)
+            cache.set(cache_key, upstream_data)
+        except urllib.error.HTTPError as e:
+            return e.read(), "text/plain", e.code
+        except Exception as e:
+            guard_log.warning("UPSTREAM_ERROR pypi %s: %s", pkg_normalized, e)
+            # Fail open: pass through to upstream directly
+            return _fetch_pypi_passthrough(pkg_normalized, accept_header)
+
+    # Filter files by age
+    files = upstream_data.get("files", [])
+    versions_seen: dict[str, int] = {}  # version -> min age in days
+    for f in files:
+        ver = extract_version_from_filename(
+            f.get("filename", ""), pkg_normalized
+        )
+        if ver:
+            age = version_age_days(f.get("upload-time", ""))
+            if ver not in versions_seen or age < versions_seen[ver]:
+                versions_seen[ver] = age
+
+    # Determine which versions to keep
+    blocked_versions = set()
+    for ver, age in versions_seen.items():
+        if age < min_age and age >= 0:
+            # Check vuln bypass: would falling back leave user on a vuln version?
+            bypass_key = f"pypi:{pkg_normalized}"
+            if vuln_bypass.is_allowed(bypass_key):
+                guard_log.info(
+                    "VULN_BYPASS pypi %s %s (age=%dd)", pkg_normalized, ver, age
+                )
+                continue
+
+            blocked_versions.add(ver)
+            guard_log.info(
+                "BLOCKED pypi %s %s (age=%dd, threshold=%dd)",
+                pkg_normalized, ver, age, min_age,
+            )
+
+    # If we're blocking versions and vuln check is enabled, check if the
+    # best fallback version has known vulns
+    if blocked_versions and cfg["guard"]["check_vulns"]:
+        # Find the best fallback (newest non-blocked stable version)
+        fallback_candidates = [
+            (ver, age)
+            for ver, age in versions_seen.items()
+            if ver not in blocked_versions and not is_prerelease(ver)
+        ]
+        if fallback_candidates:
+            fallback_candidates.sort(key=lambda x: version_sort_key(x[0]), reverse=True)
+            fallback_ver = fallback_candidates[0][0]
+            vulns = check_osv_vulns(pkg_normalized, fallback_ver, "PyPI")
+            if vulns:
+                guard_log.info(
+                    "VULN_UNBLOCK pypi %s — fallback %s has vulns: %s",
+                    pkg_normalized, fallback_ver, ", ".join(vulns[:5]),
+                )
+                vuln_bypass.allow(f"pypi:{pkg_normalized}")
+                blocked_versions.clear()
+
+    # Filter files
+    filtered_files = []
+    for f in files:
+        ver = extract_version_from_filename(
+            f.get("filename", ""), pkg_normalized
+        )
+        if ver and ver in blocked_versions:
+            continue
+        filtered_files.append(f)
+
+    # Filter versions list
+    filtered_versions = [
+        v for v in upstream_data.get("versions", []) if v not in blocked_versions
+    ]
+
+    # Determine response format
+    wants_json = "application/vnd.pypi.simple.v1+json" in accept_header
+
+    if wants_json:
+        result = dict(upstream_data)
+        result["files"] = filtered_files
+        result["versions"] = filtered_versions
+        return (
+            json.dumps(result).encode(),
+            "application/vnd.pypi.simple.v1+json",
+            200,
+        )
+    else:
+        # Render as HTML
+        html_body = _render_pypi_html(pkg_normalized, filtered_files)
+        return html_body.encode(), "text/html", 200
+
+
+def _fetch_pypi_passthrough(
+    pkg_normalized: str, accept_header: str
+) -> tuple[bytes, str, int]:
+    """Fetch from PyPI and pass through unmodified."""
+    url = f"https://pypi.org/simple/{pkg_normalized}/"
+    try:
+        body, headers = fetch_url(url, headers={"Accept": accept_header})
+        ct = headers.get("Content-Type", "text/html")
+        return body, ct, 200
+    except urllib.error.HTTPError as e:
+        return e.read(), "text/plain", e.code
+    except Exception:
+        return b"Upstream error", "text/plain", 502
+
+
+def _render_pypi_html(pkg_normalized: str, files: list[dict]) -> str:
+    """Render PyPI Simple API HTML from file list."""
+    links = []
+    for f in files:
+        url = f.get("url", "")
+        filename = f.get("filename", "")
+        attrs = ""
+        if f.get("requires-python"):
+            attrs += f' data-requires-python="{html.escape(f["requires-python"])}"'
+        if f.get("dist-info-metadata"):
+            attrs += f' data-dist-info-metadata="{html.escape(str(f["dist-info-metadata"]))}"'
+        if f.get("core-metadata"):
+            attrs += f' data-core-metadata="{html.escape(str(f["core-metadata"]))}"'
+        hashes = f.get("hashes", {})
+        if hashes:
+            hash_type, hash_val = next(iter(hashes.items()))
+            if "#" not in url:
+                url += f"#{hash_type}={hash_val}"
+        links.append(f'    <a href="{url}"{attrs}>{html.escape(filename)}</a>')
+
+    return (
+        "<!DOCTYPE html>\n<html><head><title>"
+        + html.escape(pkg_normalized)
+        + "</title></head>\n<body>\n"
+        + "\n".join(links)
+        + "\n</body></html>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# npm handler
+# ---------------------------------------------------------------------------
+
+
+def handle_npm(
+    package: str,
+    cfg: dict,
+    allowlist: Allowlist,
+    cache: Cache,
+    vuln_bypass: VulnBypassCache,
+    guard_log: logging.Logger,
+) -> tuple[bytes, str, int]:
+    """Proxy an npm registry request."""
+    min_age = cfg["guard"]["min_age_days"]
+
+    # Allowlist check (normalize scope)
+    pkg_bare = package.split("/")[-1] if "/" in package else package
+    if pkg_bare in allowlist or package in allowlist:
+        guard_log.info("ALLOWLIST npm %s", package)
+        return _fetch_npm_passthrough(package)
+
+    cache_key = f"npm:{package}"
+    upstream_data = cache.get(cache_key)
+    if upstream_data is None:
+        url = f"https://registry.npmjs.org/{package}"
+        try:
+            body, _ = fetch_url(url, headers={"Accept": "application/json"})
+            upstream_data = json.loads(body)
+            cache.set(cache_key, upstream_data)
+        except urllib.error.HTTPError as e:
+            return e.read(), "text/plain", e.code
+        except Exception as e:
+            guard_log.warning("UPSTREAM_ERROR npm %s: %s", package, e)
+            return _fetch_npm_passthrough(package)
+
+    times = upstream_data.get("time", {})
+    versions = upstream_data.get("versions", {})
+    dist_tags = upstream_data.get("dist-tags", {})
+
+    # Find blocked versions
+    blocked_versions = set()
+    for ver, ts in times.items():
+        if ver in ("created", "modified"):
+            continue
+        age = version_age_days(ts)
+        if 0 <= age < min_age:
+            bypass_key = f"npm:{pkg_bare}"
+            if vuln_bypass.is_allowed(bypass_key):
+                guard_log.info("VULN_BYPASS npm %s %s (age=%dd)", package, ver, age)
+                continue
+            blocked_versions.add(ver)
+            guard_log.info(
+                "BLOCKED npm %s %s (age=%dd, threshold=%dd)",
+                package, ver, age, min_age,
+            )
+
+    # Vuln check on fallback
+    if blocked_versions and cfg["guard"]["check_vulns"]:
+        fallback_candidates = [
+            (ver, version_age_days(times.get(ver, "")))
+            for ver in versions
+            if ver not in blocked_versions and not is_prerelease(ver)
+        ]
+        if fallback_candidates:
+            fallback_candidates.sort(
+                key=lambda x: version_sort_key(x[0]), reverse=True
+            )
+            fallback_ver = fallback_candidates[0][0]
+            vulns = check_osv_vulns(pkg_bare, fallback_ver, "npm")
+            if vulns:
+                guard_log.info(
+                    "VULN_UNBLOCK npm %s — fallback %s has vulns: %s",
+                    package, fallback_ver, ", ".join(vulns[:5]),
+                )
+                vuln_bypass.allow(f"npm:{pkg_bare}")
+                blocked_versions.clear()
+
+    # Filter
+    filtered_versions = {k: v for k, v in versions.items() if k not in blocked_versions}
+    filtered_times = {k: v for k, v in times.items() if k not in blocked_versions}
+
+    # Fix dist-tags if latest was blocked
+    filtered_dist_tags = dict(dist_tags)
+    for tag, ver in dist_tags.items():
+        if ver in blocked_versions:
+            # Find newest surviving stable version
+            surviving = [
+                v for v in filtered_versions if not is_prerelease(v)
+            ]
+            if surviving:
+                surviving.sort(key=version_sort_key, reverse=True)
+                filtered_dist_tags[tag] = surviving[0]
+                guard_log.info(
+                    "REWRITE npm %s dist-tag %s: %s → %s",
+                    package, tag, ver, surviving[0],
+                )
+            else:
+                del filtered_dist_tags[tag]
+
+    result = dict(upstream_data)
+    result["versions"] = filtered_versions
+    result["time"] = filtered_times
+    result["dist-tags"] = filtered_dist_tags
+
+    return json.dumps(result).encode(), "application/json", 200
+
+
+def _fetch_npm_passthrough(package: str) -> tuple[bytes, str, int]:
+    url = f"https://registry.npmjs.org/{package}"
+    try:
+        body, headers = fetch_url(url)
+        ct = headers.get("Content-Type", "application/json")
+        return body, ct, 200
+    except urllib.error.HTTPError as e:
+        return e.read(), "text/plain", e.code
+    except Exception:
+        return b"Upstream error", "text/plain", 502
+
+
+# ---------------------------------------------------------------------------
+# HTTP request handler
+# ---------------------------------------------------------------------------
+
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    cfg: dict
+    allowlist: Allowlist
+    cache: Cache
+    vuln_bypass: VulnBypassCache
+    guard_log: logging.Logger
+
+    def do_GET(self):
+        path = self.path.rstrip("/")
+
+        # Health check
+        if path == "/health":
+            self._respond(200, "application/json", json.dumps({"status": "ok"}).encode())
+            return
+
+        # Status
+        if path == "/status":
+            info = {
+                "status": "running",
+                "min_age_days": self.cfg["guard"]["min_age_days"],
+                "check_vulns": self.cfg["guard"]["check_vulns"],
+            }
+            self._respond(200, "application/json", json.dumps(info).encode())
+            return
+
+        # PyPI Simple API: /pypi/simple/{package}/
+        pypi_match = re.match(r"^/pypi/simple/([^/]+)/?$", self.path)
+        if pypi_match:
+            package = pypi_match.group(1)
+            accept = self.headers.get("Accept", "text/html")
+            try:
+                body, ct, status = handle_pypi_simple(
+                    package, accept, self.cfg, self.allowlist,
+                    self.cache, self.vuln_bypass, self.guard_log,
+                )
+                self._respond(status, ct, body)
+            except Exception as e:
+                self.guard_log.error("ERROR pypi %s: %s", package, e)
+                self._respond(502, "text/plain", f"Proxy error: {e}".encode())
+            return
+
+        # PyPI Simple API index: /pypi/simple/
+        if path == "/pypi/simple":
+            # Pass through the package listing
+            try:
+                body, headers = fetch_url(
+                    "https://pypi.org/simple/",
+                    headers={"Accept": self.headers.get("Accept", "text/html")},
+                )
+                ct = headers.get("Content-Type", "text/html")
+                self._respond(200, ct, body)
+            except Exception:
+                self._respond(502, "text/plain", b"Upstream error")
+            return
+
+        # npm registry: /npm/{package} or /npm/@scope/package
+        npm_match = re.match(r"^/npm/(.+?)/?$", self.path)
+        if npm_match:
+            package = npm_match.group(1)
+            # Decode %2f for scoped packages
+            package = package.replace("%2f", "/")
+            try:
+                body, ct, status = handle_npm(
+                    package, self.cfg, self.allowlist,
+                    self.cache, self.vuln_bypass, self.guard_log,
+                )
+                self._respond(status, ct, body)
+            except Exception as e:
+                self.guard_log.error("ERROR npm %s: %s", package, e)
+                self._respond(502, "text/plain", f"Proxy error: {e}".encode())
+            return
+
+        self._respond(404, "text/plain", b"Not found")
+
+    def do_POST(self):
+        # Vuln bypass endpoint: POST /vuln-bypass/{ecosystem}/{package}/{version}
+        m = re.match(r"^/vuln-bypass/(\w+)/([^/]+)/([^/]+)$", self.path)
+        if m:
+            ecosystem, pkg, version = m.group(1), m.group(2), m.group(3)
+            eco_map = {"pypi": "PyPI", "npm": "npm"}
+            eco = eco_map.get(ecosystem.lower(), ecosystem)
+            vulns = check_osv_vulns(pkg, version, eco)
+            if vulns:
+                self.vuln_bypass.allow(f"{ecosystem.lower()}:{pkg}")
+                self.guard_log.info(
+                    "VULN_BYPASS_MANUAL %s %s %s vulns=%s",
+                    ecosystem, pkg, version, ",".join(vulns[:5]),
+                )
+                result = {"bypassed": True, "vulns": vulns}
+            else:
+                result = {"bypassed": False, "vulns": []}
+            self._respond(200, "application/json", json.dumps(result).encode())
+            return
+
+        self._respond(404, "text/plain", b"Not found")
+
+    def _respond(self, status: int, content_type: str, body: bytes):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        """Suppress default access logging — we log decisions instead."""
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+
+
+def run_server(cfg: dict):
+    """Run the proxy server."""
+    # Set up logging
+    log_path = pathlib.Path(cfg["paths"]["log"])
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    guard_log = logging.getLogger("pkg-guard")
+    guard_log.setLevel(logging.INFO)
+
+    # File handler
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%SZ"))
+    guard_log.addHandler(fh)
+
+    # Stderr handler for foreground mode
+    sh = logging.StreamHandler()
+    sh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+    guard_log.addHandler(sh)
+
+    allowlist = Allowlist(cfg["paths"]["allowlist"])
+    cache = Cache(ttl_seconds=600)
+    vuln_bypass = VulnBypassCache(ttl_seconds=3600)
+
+    # Inject dependencies into handler class
+    ProxyHandler.cfg = cfg
+    ProxyHandler.allowlist = allowlist
+    ProxyHandler.cache = cache
+    ProxyHandler.vuln_bypass = vuln_bypass
+    ProxyHandler.guard_log = guard_log
+
+    host = cfg["server"]["host"]
+    port = cfg["server"]["port"]
+
+    server = ThreadingHTTPServer((host, port), ProxyHandler)
+    guard_log.info("pkg-guard proxy listening on %s:%d (min_age=%dd)", host, port, cfg["guard"]["min_age_days"])
+    print(f"\033[0;32m🛡  pkg-guard proxy listening on {host}:{port}\033[0m")
+    print(f"    Min age: {cfg['guard']['min_age_days']}d | Vuln bypass: {cfg['guard']['check_vulns']}")
+    print(f"    Log: {cfg['paths']['log']}")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# launchd management
+# ---------------------------------------------------------------------------
+
+PLIST_LABEL = "com.pkg-guard.proxy"
+PLIST_PATH = pathlib.Path(f"~/Library/LaunchAgents/{PLIST_LABEL}.plist").expanduser()
+
+
+def get_plist(cfg: dict) -> dict:
+    script_path = str(pathlib.Path(__file__).resolve())
+    log_dir = pathlib.Path("~/.local/share/pkg-guard").expanduser()
+    return {
+        "Label": PLIST_LABEL,
+        "ProgramArguments": [sys.executable, script_path, "serve"],
+        "KeepAlive": {"SuccessfulExit": False},
+        "RunAtLoad": True,
+        "StandardOutPath": str(log_dir / "stdout.log"),
+        "StandardErrorPath": str(log_dir / "stderr.log"),
+        "EnvironmentVariables": {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+        },
+    }
+
+
+def cmd_start(cfg: dict):
+    """Install and start the launchd agent."""
+    log_dir = pathlib.Path("~/.local/share/pkg-guard").expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    plist_data = get_plist(cfg)
+    with open(PLIST_PATH, "wb") as f:
+        plistlib.dump(plist_data, f)
+
+    subprocess.run(["launchctl", "unload", str(PLIST_PATH)], capture_output=True)
+    result = subprocess.run(["launchctl", "load", str(PLIST_PATH)], capture_output=True, text=True)
+    if result.returncode == 0:
+        print("\033[0;32m✓ pkg-guard proxy started (launchd)\033[0m")
+        print(f"  Plist: {PLIST_PATH}")
+    else:
+        print(f"\033[0;31m✗ Failed to start: {result.stderr}\033[0m", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_stop(_cfg: dict):
+    """Stop and uninstall the launchd agent."""
+    if PLIST_PATH.exists():
+        subprocess.run(["launchctl", "unload", str(PLIST_PATH)], capture_output=True)
+        PLIST_PATH.unlink()
+        print("\033[0;32m✓ pkg-guard proxy stopped\033[0m")
+    else:
+        print("pkg-guard proxy is not installed.")
+
+
+def cmd_status(cfg: dict):
+    """Show proxy status."""
+    print("pkg-guard status")
+    print(f"  Config:      {CONFIG_PATH}")
+    print(f"  Min age:     {cfg['guard']['min_age_days']} days")
+    print(f"  Vuln bypass: {cfg['guard']['check_vulns']}")
+    print(f"  Allowlist:   {cfg['paths']['allowlist']}")
+    print(f"  Log:         {cfg['paths']['log']}")
+    print(f"  Launchd:     {'installed' if PLIST_PATH.exists() else 'not installed'}")
+
+    # Check if running
+    host = cfg["server"]["host"]
+    port = cfg["server"]["port"]
+    try:
+        req = urllib.request.Request(f"http://{host}:{port}/health")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read())
+        if data.get("status") == "ok":
+            print(f"  Proxy:       \033[0;32mrunning on {host}:{port}\033[0m")
+        else:
+            print(f"  Proxy:       \033[0;31mnot responding\033[0m")
+    except Exception:
+        print(f"  Proxy:       \033[0;31mnot running\033[0m")
+
+    # Check client config
+    print()
+    pip_conf = pathlib.Path("~/.config/pip/pip.conf").expanduser()
+    uv_toml = pathlib.Path("~/.config/uv/uv.toml").expanduser()
+    npmrc = pathlib.Path("~/.npmrc").expanduser()
+
+    proxy_url = f"http://{host}:{port}"
+    for label, path, search in [
+        ("pip", pip_conf, proxy_url),
+        ("uv", uv_toml, proxy_url),
+        ("npm", npmrc, proxy_url),
+    ]:
+        if path.exists() and proxy_url in path.read_text():
+            print(f"  {label:10s} \033[0;32mconfigured\033[0m ({path})")
+        else:
+            print(f"  {label:10s} \033[0;33mnot configured\033[0m (run: pkg-guard setup)")
+
+
+# ---------------------------------------------------------------------------
+# Client config setup/teardown
+# ---------------------------------------------------------------------------
+
+
+def cmd_setup(cfg: dict):
+    """Configure pip, uv, and npm to use the proxy."""
+    host = cfg["server"]["host"]
+    port = cfg["server"]["port"]
+    proxy_url = f"http://{host}:{port}"
+
+    # pip
+    pip_conf = pathlib.Path("~/.config/pip/pip.conf").expanduser()
+    pip_conf.parent.mkdir(parents=True, exist_ok=True)
+    pip_content = f"[global]\nindex-url = {proxy_url}/pypi/simple/\ntrusted-host = {host}\n"
+    if pip_conf.exists():
+        existing = pip_conf.read_text()
+        if proxy_url in existing:
+            print(f"  pip: already configured")
+        else:
+            # Back up and overwrite
+            shutil.copy2(pip_conf, pip_conf.with_suffix(".conf.bak"))
+            pip_conf.write_text(pip_content)
+            print(f"  pip: configured (backed up original to {pip_conf.with_suffix('.conf.bak')})")
+    else:
+        pip_conf.write_text(pip_content)
+        print(f"  pip: configured")
+
+    # uv
+    uv_toml = pathlib.Path("~/.config/uv/uv.toml").expanduser()
+    uv_toml.parent.mkdir(parents=True, exist_ok=True)
+    uv_content = f'index-url = "{proxy_url}/pypi/simple/"\n'
+    if uv_toml.exists():
+        existing = uv_toml.read_text()
+        if proxy_url in existing:
+            print(f"  uv:  already configured")
+        else:
+            shutil.copy2(uv_toml, uv_toml.with_suffix(".toml.bak"))
+            uv_toml.write_text(uv_content)
+            print(f"  uv:  configured (backed up original to {uv_toml.with_suffix('.toml.bak')})")
+    else:
+        uv_toml.write_text(uv_content)
+        print(f"  uv:  configured")
+
+    # npm — preserve existing entries (like scoped registries)
+    npmrc = pathlib.Path("~/.npmrc").expanduser()
+    registry_line = f"registry={proxy_url}/npm/"
+    if npmrc.exists():
+        existing = npmrc.read_text()
+        if proxy_url in existing:
+            print(f"  npm: already configured")
+        else:
+            # Remove any existing top-level registry= line, add ours
+            lines = existing.splitlines()
+            new_lines = [l for l in lines if not re.match(r"^registry\s*=", l)]
+            new_lines.insert(0, registry_line)
+            shutil.copy2(npmrc, npmrc.with_suffix(".npmrc.bak"))
+            npmrc.write_text("\n".join(new_lines) + "\n")
+            print(f"  npm: configured (backed up original to {npmrc.with_suffix('.npmrc.bak')})")
+    else:
+        npmrc.write_text(registry_line + "\n")
+        print(f"  npm: configured")
+
+    print(f"\n\033[0;32m✓ All package managers configured to use proxy at {proxy_url}\033[0m")
+
+
+def cmd_unsetup(cfg: dict):
+    """Remove proxy config from pip, uv, and npm."""
+    host = cfg["server"]["host"]
+    port = cfg["server"]["port"]
+    proxy_url = f"http://{host}:{port}"
+
+    # pip — restore backup or remove
+    pip_conf = pathlib.Path("~/.config/pip/pip.conf").expanduser()
+    pip_bak = pip_conf.with_suffix(".conf.bak")
+    if pip_conf.exists() and proxy_url in pip_conf.read_text():
+        if pip_bak.exists():
+            shutil.move(pip_bak, pip_conf)
+            print("  pip: restored from backup")
+        else:
+            pip_conf.unlink()
+            print("  pip: removed config")
+    else:
+        print("  pip: not configured (no change)")
+
+    # uv — restore backup or remove
+    uv_toml = pathlib.Path("~/.config/uv/uv.toml").expanduser()
+    uv_bak = uv_toml.with_suffix(".toml.bak")
+    if uv_toml.exists() and proxy_url in uv_toml.read_text():
+        if uv_bak.exists():
+            shutil.move(uv_bak, uv_toml)
+            print("  uv:  restored from backup")
+        else:
+            uv_toml.unlink()
+            print("  uv:  removed config")
+    else:
+        print("  uv:  not configured (no change)")
+
+    # npm — remove registry line, keep the rest
+    npmrc = pathlib.Path("~/.npmrc").expanduser()
+    if npmrc.exists():
+        existing = npmrc.read_text()
+        if proxy_url in existing:
+            lines = existing.splitlines()
+            new_lines = [l for l in lines if proxy_url not in l]
+            if new_lines:
+                npmrc.write_text("\n".join(new_lines) + "\n")
+            else:
+                npmrc.unlink()
+            print("  npm: removed proxy config")
+        else:
+            print("  npm: not configured (no change)")
+    else:
+        print("  npm: not configured (no change)")
+
+    print(f"\n\033[0;32m✓ Proxy config removed\033[0m")
+
+
+# ---------------------------------------------------------------------------
+# Allowlist commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_allow(cfg: dict, pkg: str):
+    al = Allowlist(cfg["paths"]["allowlist"])
+    al.add(pkg)
+    print(f"\033[0;32m✓ Added '{pkg}' to allowlist\033[0m")
+
+
+def cmd_deny(cfg: dict, pkg: str):
+    al = Allowlist(cfg["paths"]["allowlist"])
+    al.remove(pkg)
+    print(f"\033[0;33m✓ Removed '{pkg}' from allowlist\033[0m")
+
+
+# ---------------------------------------------------------------------------
+# Log command
+# ---------------------------------------------------------------------------
+
+
+def cmd_log(cfg: dict):
+    log_path = cfg["paths"]["log"]
+    if os.path.exists(log_path):
+        os.execvp("tail", ["tail", "-f", "-n", "50", log_path])
+    else:
+        print("No log file yet.")
+
+
+# ---------------------------------------------------------------------------
+# Manual check
+# ---------------------------------------------------------------------------
+
+
+def cmd_check(cfg: dict, pkg: str):
+    """Check a PyPI package's latest version age."""
+    min_age = cfg["guard"]["min_age_days"]
+    try:
+        url = f"https://pypi.org/pypi/{pkg}/json"
+        body, _ = fetch_url(url)
+        data = json.loads(body)
+    except Exception as e:
+        print(f"\033[0;31m✗ Could not fetch '{pkg}': {e}\033[0m")
+        return
+
+    version = data.get("info", {}).get("version", "")
+    files = data.get("urls", [])
+    upload_time = ""
+    if files:
+        upload_time = files[0].get("upload_time_iso_8601", "")
+
+    age = version_age_days(upload_time)
+    if age < 0:
+        print(f"\033[0;33m⚠  Could not determine age for {pkg}=={version}\033[0m")
+    elif age < min_age:
+        print(f"\033[0;31m🛡  {pkg}=={version} is {age} day(s) old (threshold: {min_age}d) — BLOCKED\033[0m")
+        # Find safe fallback
+        releases = data.get("releases", {})
+        candidates = []
+        for ver, rfiles in releases.items():
+            if not rfiles or is_prerelease(ver):
+                continue
+            ts = rfiles[0].get("upload_time_iso_8601", "")
+            a = version_age_days(ts)
+            if a >= min_age:
+                candidates.append((version_sort_key(ver), ver, a))
+        if candidates:
+            candidates.sort(reverse=True)
+            safe = candidates[0]
+            print(f"\033[0;36m    Newest safe: {pkg}=={safe[1]} ({safe[2]} days old)\033[0m")
+    else:
+        print(f"\033[0;32m✓  {pkg}=={version} is {age} day(s) old — OK\033[0m")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="pkg-guard",
+        description="Local registry proxy that blocks too-young package versions.",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("serve", help="Run the proxy server (foreground)")
+    sub.add_parser("start", help="Install and start launchd agent")
+    sub.add_parser("stop", help="Stop and uninstall launchd agent")
+    sub.add_parser("status", help="Show proxy status and config")
+    sub.add_parser("setup", help="Configure pip/uv/npm to use the proxy")
+    sub.add_parser("unsetup", help="Remove proxy config from pip/uv/npm")
+    sub.add_parser("log", help="Tail the log file")
+
+    p_allow = sub.add_parser("allow", help="Add package to allowlist")
+    p_allow.add_argument("package")
+
+    p_deny = sub.add_parser("deny", help="Remove package from allowlist")
+    p_deny.add_argument("package")
+
+    p_check = sub.add_parser("check", help="Check a package's version age")
+    p_check.add_argument("package")
+
+    args = parser.parse_args()
+    cfg = load_config()
+
+    match args.command:
+        case "serve":
+            run_server(cfg)
+        case "start":
+            cmd_start(cfg)
+        case "stop":
+            cmd_stop(cfg)
+        case "status":
+            cmd_status(cfg)
+        case "setup":
+            cmd_setup(cfg)
+        case "unsetup":
+            cmd_unsetup(cfg)
+        case "log":
+            cmd_log(cfg)
+        case "allow":
+            cmd_allow(cfg, args.package)
+        case "deny":
+            cmd_deny(cfg, args.package)
+        case "check":
+            cmd_check(cfg, args.package)
+        case _:
+            parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
