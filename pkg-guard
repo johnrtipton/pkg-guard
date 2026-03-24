@@ -599,12 +599,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
     vuln_bypass: VulnBypassCache
     guard_log: logging.Logger
 
-    def do_GET(self):
+    def _handle_request(self, head_only: bool = False):
         path = self.path.rstrip("/")
 
         # Health check
         if path == "/health":
-            self._respond(200, "application/json", json.dumps({"status": "ok"}).encode())
+            self._respond(200, "application/json", json.dumps({"status": "ok"}).encode(), head_only)
             return
 
         # Status
@@ -614,7 +614,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "min_age_days": self.cfg["guard"]["min_age_days"],
                 "check_vulns": self.cfg["guard"]["check_vulns"],
             }
-            self._respond(200, "application/json", json.dumps(info).encode())
+            self._respond(200, "application/json", json.dumps(info).encode(), head_only)
             return
 
         # PyPI Simple API: /pypi/simple/{package}/
@@ -622,7 +622,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if pypi_match:
             package = pypi_match.group(1)
             if not _PYPI_PKG_RE.match(package):
-                self._respond(400, "text/plain", b"Invalid package name")
+                self._respond(400, "text/plain", b"Invalid package name", head_only)
                 return
             accept = self.headers.get("Accept", "text/html")
             try:
@@ -630,24 +630,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     package, accept, self.cfg, self.allowlist,
                     self.cache, self.vuln_bypass, self.guard_log,
                 )
-                self._respond(status, ct, body)
+                self._respond(status, ct, body, head_only)
             except Exception as e:
                 self.guard_log.error("ERROR pypi %s: %s", package, e)
-                self._respond(502, "text/plain", b"Proxy error")
+                self._respond(502, "text/plain", b"Proxy error", head_only)
             return
 
-        # PyPI Simple API index: /pypi/simple/
+        # PyPI Simple API index: /pypi/simple/ — reject, don't proxy the 38MB index
         if path == "/pypi/simple":
-            # Pass through the package listing
-            try:
-                body, headers = fetch_url(
-                    "https://pypi.org/simple/",
-                    headers={"Accept": self.headers.get("Accept", "text/html")},
-                )
-                ct = headers.get("Content-Type", "text/html")
-                self._respond(200, ct, body)
-            except Exception:
-                self._respond(502, "text/plain", b"Upstream error")
+            self._respond(400, "text/plain", b"Package name required", head_only)
             return
 
         # npm registry: /npm/{package} or /npm/@scope/package
@@ -657,20 +648,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # Decode %2f/%2F for scoped packages
             package = package.replace("%2f", "/").replace("%2F", "/")
             if not _NPM_PKG_RE.match(package):
-                self._respond(400, "text/plain", b"Invalid package name")
+                self._respond(400, "text/plain", b"Invalid package name", head_only)
                 return
             try:
                 body, ct, status = handle_npm(
                     package, self.cfg, self.allowlist,
                     self.cache, self.vuln_bypass, self.guard_log,
                 )
-                self._respond(status, ct, body)
+                self._respond(status, ct, body, head_only)
             except Exception as e:
                 self.guard_log.error("ERROR npm %s: %s", package, e)
-                self._respond(502, "text/plain", b"Proxy error")
+                self._respond(502, "text/plain", b"Proxy error", head_only)
             return
 
-        self._respond(404, "text/plain", b"Not found")
+        self._respond(404, "text/plain", b"Not found", head_only)
+
+    def do_GET(self):
+        self._handle_request()
+
+    def do_HEAD(self):
+        self._handle_request(head_only=True)
 
     def do_POST(self):
         # Vuln bypass endpoint: POST /vuln-bypass/{ecosystem}/{package}/{version}
@@ -692,14 +689,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._respond(200, "application/json", json.dumps(result).encode())
             return
 
-        self._respond(404, "text/plain", b"Not found")
+        self._respond(405, "text/plain", b"Method not allowed")
 
-    def _respond(self, status: int, content_type: str, body: bytes):
+    def _respond(self, status: int, content_type: str, body: bytes, head_only: bool = False):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if not head_only:
+            self.wfile.write(body)
 
     def log_message(self, format, *args):
         """Suppress default access logging — we log decisions instead."""
