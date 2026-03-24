@@ -70,6 +70,33 @@ log = "~/.local/share/pkg-guard/guard.log"
 
 This means cron jobs, CI scripts, and subprocess-spawned installs all go through the proxy without needing environment variables.
 
+## What's protected
+
+| Tool | Protected | Notes |
+|------|-----------|-------|
+| pip install | Yes | Via `~/.config/pip/pip.conf` |
+| uv pip install / uv add | Yes | Via `~/.config/uv/uv.toml` |
+| npm install / npx | Yes | Via `~/.npmrc` |
+| pipx install | Yes | Reads pip.conf |
+| uv tool install | Yes | Reads uv.toml |
+| npm ci (lockfile) | Yes | npm rewrites resolved URLs to use configured registry |
+
+## Known bypass vectors
+
+These patterns bypass the proxy. `pkg-guard status` detects some of them.
+
+| Vector | Severity | Mitigation |
+|--------|----------|------------|
+| `--index-url` / `--extra-index-url` CLI flags | High | Not preventable at config level |
+| `PIP_INDEX_URL` / `UV_INDEX_URL` env vars | High | `pkg-guard status` warns if set |
+| `pip install <direct URL>` / `git+https://...` | High | No index lookup occurs |
+| Poetry | High | Ignores pip.conf; no global proxy config |
+| `brew install` | High | Uses its own CDN |
+| `PIP_EXTRA_INDEX_URL` env var | Medium | `pkg-guard status` warns if set |
+| `pyproject.toml` `[[tool.uv.index]]` | Medium | Per-project override |
+
+**Architectural limit**: pkg-guard intercepts registry/index lookups. Direct URL downloads, git installs, and tools with their own registry config bypass it entirely. Full protection would require network-level controls (firewall rules, transparent proxy).
+
 ## Requirements
 
 - Python 3.11+ (uses `tomllib` from stdlib)

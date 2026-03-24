@@ -840,15 +840,31 @@ def cmd_status(cfg: dict):
     npmrc = pathlib.Path("~/.npmrc").expanduser()
 
     proxy_url = f"http://{host}:{port}"
-    for label, path, search in [
-        ("pip", pip_conf, proxy_url),
-        ("uv", uv_toml, proxy_url),
-        ("npm", npmrc, proxy_url),
+    for label, path in [
+        ("pip", pip_conf),
+        ("uv", uv_toml),
+        ("npm", npmrc),
     ]:
         if path.exists() and proxy_url in path.read_text():
             print(f"  {label:10s} \033[0;32mconfigured\033[0m ({path})")
         else:
             print(f"  {label:10s} \033[0;33mnot configured\033[0m (run: pkg-guard setup)")
+
+    # Check for active bypass risks
+    print()
+    bypasses = []
+    for var in ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "UV_INDEX_URL", "UV_EXTRA_INDEX_URL"):
+        val = os.environ.get(var, "")
+        if val and proxy_url not in val:
+            bypasses.append(f"  \033[0;31m⚠  {var}={val} (bypasses proxy)\033[0m")
+    if shutil.which("poetry"):
+        bypasses.append("  \033[0;33m⚠  poetry installed (uses pypi.org directly, no global proxy support)\033[0m")
+    if bypasses:
+        print("  Bypass risks:")
+        for b in bypasses:
+            print(b)
+    else:
+        print("  \033[0;32mNo active bypass risks detected\033[0m")
 
 
 # ---------------------------------------------------------------------------
