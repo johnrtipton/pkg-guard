@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import copy
 import datetime
 import html
 import json
@@ -31,7 +32,6 @@ import re
 import shutil
 import subprocess
 import sys
-import textwrap
 import threading
 import time
 import urllib.error
@@ -57,7 +57,7 @@ CONFIG_PATH = pathlib.Path("~/.config/pkg-guard/config.toml").expanduser()
 
 def load_config() -> dict:
     """Load config from TOML, falling back to defaults."""
-    cfg = DEFAULT_CONFIG.copy()
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         try:
             import tomllib
@@ -67,8 +67,8 @@ def load_config() -> dict:
             for section in cfg:
                 if section in user_cfg:
                     cfg[section].update(user_cfg[section])
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"\033[0;33m⚠  Failed to load {CONFIG_PATH}: {e}\033[0m", file=sys.stderr)
     # Expand ~ in paths
     for key in cfg["paths"]:
         cfg["paths"][key] = os.path.expanduser(cfg["paths"][key])
@@ -84,30 +84,49 @@ class Allowlist:
     def __init__(self, path: str):
         self.path = pathlib.Path(path)
         self._entries: set[str] = set()
+        self._lowered: set[str] = set()
+        self._mtime: float = 0
+        self._lock = threading.Lock()
         self._load()
 
     def _load(self):
-        if self.path.exists():
-            self._entries = {
-                line.strip()
-                for line in self.path.read_text().splitlines()
-                if line.strip()
-            }
+        try:
+            if self.path.exists():
+                mtime = self.path.stat().st_mtime
+                if mtime != self._mtime:
+                    self._entries = {
+                        line.strip()
+                        for line in self.path.read_text().splitlines()
+                        if line.strip()
+                    }
+                    self._lowered = {e.lower() for e in self._entries}
+                    self._mtime = mtime
+        except OSError:
+            pass
 
     def __contains__(self, pkg: str) -> bool:
-        return pkg.lower() in {e.lower() for e in self._entries}
+        with self._lock:
+            self._load()  # Auto-reload if file changed
+            return pkg.lower() in self._lowered
 
     def add(self, pkg: str):
-        self._entries.add(pkg)
-        self._save()
+        with self._lock:
+            self._load()
+            self._entries.add(pkg)
+            self._lowered.add(pkg.lower())
+            self._save()
 
     def remove(self, pkg: str):
-        self._entries = {e for e in self._entries if e.lower() != pkg.lower()}
-        self._save()
+        with self._lock:
+            self._load()
+            self._entries = {e for e in self._entries if e.lower() != pkg.lower()}
+            self._lowered = {e.lower() for e in self._entries}
+            self._save()
 
     def _save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("\n".join(sorted(self._entries)) + "\n")
+        self._mtime = self.path.stat().st_mtime
 
 
 # ---------------------------------------------------------------------------
@@ -143,10 +162,11 @@ def check_osv_vulns(pkg: str, version: str, ecosystem: str) -> list[str]:
 
 
 class Cache:
-    """Simple in-memory cache with TTL."""
+    """Simple in-memory cache with TTL and max size."""
 
-    def __init__(self, ttl_seconds: int = 600):
+    def __init__(self, ttl_seconds: int = 600, max_size: int = 500):
         self.ttl = ttl_seconds
+        self.max_size = max_size
         self._data: dict[str, tuple[float, Any]] = {}
         self._lock = threading.Lock()
 
@@ -162,6 +182,19 @@ class Cache:
     def set(self, key: str, val: Any):
         with self._lock:
             self._data[key] = (time.time(), val)
+            if len(self._data) > self.max_size:
+                self._evict()
+
+    def _evict(self):
+        """Remove expired entries, then oldest if still over max size."""
+        now = time.time()
+        expired = [k for k, (ts, _) in self._data.items() if now - ts >= self.ttl]
+        for k in expired:
+            del self._data[k]
+        if len(self._data) > self.max_size:
+            by_age = sorted(self._data.items(), key=lambda x: x[1][0])
+            for k, _ in by_age[: len(self._data) - self.max_size]:
+                del self._data[k]
 
 
 # ---------------------------------------------------------------------------
@@ -221,12 +254,18 @@ def version_sort_key(v: str) -> tuple:
 
 
 def is_prerelease(v: str) -> bool:
-    return bool(re.search(r"(a|b|rc|dev|alpha|beta|pre|canary|next)", v, re.I))
+    return bool(re.search(r"(?:\d)(a|b|rc|dev|alpha|beta|pre)(?:\d|$)", v, re.I) or
+                re.search(r"[-.]?(canary|next|preview)(?:\d|[-.]|$)", v, re.I))
 
 
 def normalize_pypi_name(name: str) -> str:
     """PEP 503 normalization."""
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+# Package name validation patterns
+_PYPI_PKG_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$")
+_NPM_PKG_RE = re.compile(r"^(@[a-z0-9\-~][a-z0-9\-._~]*/)?[a-z0-9\-~][a-z0-9\-._~]*$")
 
 
 def extract_version_from_filename(filename: str, pkg_normalized: str) -> str | None:
@@ -582,6 +621,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         pypi_match = re.match(r"^/pypi/simple/([^/]+)/?$", self.path)
         if pypi_match:
             package = pypi_match.group(1)
+            if not _PYPI_PKG_RE.match(package):
+                self._respond(400, "text/plain", b"Invalid package name")
+                return
             accept = self.headers.get("Accept", "text/html")
             try:
                 body, ct, status = handle_pypi_simple(
@@ -591,7 +633,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._respond(status, ct, body)
             except Exception as e:
                 self.guard_log.error("ERROR pypi %s: %s", package, e)
-                self._respond(502, "text/plain", f"Proxy error: {e}".encode())
+                self._respond(502, "text/plain", b"Proxy error")
             return
 
         # PyPI Simple API index: /pypi/simple/
@@ -612,8 +654,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         npm_match = re.match(r"^/npm/(.+?)/?$", self.path)
         if npm_match:
             package = npm_match.group(1)
-            # Decode %2f for scoped packages
-            package = package.replace("%2f", "/")
+            # Decode %2f/%2F for scoped packages
+            package = package.replace("%2f", "/").replace("%2F", "/")
+            if not _NPM_PKG_RE.match(package):
+                self._respond(400, "text/plain", b"Invalid package name")
+                return
             try:
                 body, ct, status = handle_npm(
                     package, self.cfg, self.allowlist,
@@ -622,7 +667,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._respond(status, ct, body)
             except Exception as e:
                 self.guard_log.error("ERROR npm %s: %s", package, e)
-                self._respond(502, "text/plain", f"Proxy error: {e}".encode())
+                self._respond(502, "text/plain", b"Proxy error")
             return
 
         self._respond(404, "text/plain", b"Not found")
@@ -819,38 +864,53 @@ def cmd_setup(cfg: dict):
     port = cfg["server"]["port"]
     proxy_url = f"http://{host}:{port}"
 
-    # pip
+    # pip — merge with existing config
     pip_conf = pathlib.Path("~/.config/pip/pip.conf").expanduser()
     pip_conf.parent.mkdir(parents=True, exist_ok=True)
-    pip_content = f"[global]\nindex-url = {proxy_url}/pypi/simple/\ntrusted-host = {host}\n"
+    pip_lines = [
+        f"index-url = {proxy_url}/pypi/simple/",
+        f"trusted-host = {host}",
+    ]
     if pip_conf.exists():
         existing = pip_conf.read_text()
         if proxy_url in existing:
-            print(f"  pip: already configured")
+            print("  pip: already configured")
         else:
-            # Back up and overwrite
             shutil.copy2(pip_conf, pip_conf.with_suffix(".conf.bak"))
-            pip_conf.write_text(pip_content)
+            # Remove existing index-url/trusted-host lines, preserve everything else
+            lines = existing.splitlines()
+            filtered = [l for l in lines if not re.match(r"^\s*(index-url|trusted-host)\s*=", l)]
+            # Ensure [global] section exists
+            if not any(re.match(r"^\[global\]", l) for l in filtered):
+                filtered.insert(0, "[global]")
+            # Insert our lines after [global]
+            idx = next(i for i, l in enumerate(filtered) if re.match(r"^\[global\]", l))
+            for j, line in enumerate(pip_lines):
+                filtered.insert(idx + 1 + j, line)
+            pip_conf.write_text("\n".join(filtered) + "\n")
             print(f"  pip: configured (backed up original to {pip_conf.with_suffix('.conf.bak')})")
     else:
-        pip_conf.write_text(pip_content)
-        print(f"  pip: configured")
+        pip_conf.write_text("[global]\n" + "\n".join(pip_lines) + "\n")
+        print("  pip: configured")
 
-    # uv
+    # uv — merge with existing config
     uv_toml = pathlib.Path("~/.config/uv/uv.toml").expanduser()
     uv_toml.parent.mkdir(parents=True, exist_ok=True)
-    uv_content = f'index-url = "{proxy_url}/pypi/simple/"\n'
+    uv_line = f'index-url = "{proxy_url}/pypi/simple/"'
     if uv_toml.exists():
         existing = uv_toml.read_text()
         if proxy_url in existing:
-            print(f"  uv:  already configured")
+            print("  uv:  already configured")
         else:
             shutil.copy2(uv_toml, uv_toml.with_suffix(".toml.bak"))
-            uv_toml.write_text(uv_content)
+            # Remove existing index-url, preserve everything else
+            lines = [l for l in existing.splitlines() if not re.match(r"^\s*index-url\s*=", l)]
+            lines.insert(0, uv_line)
+            uv_toml.write_text("\n".join(lines) + "\n")
             print(f"  uv:  configured (backed up original to {uv_toml.with_suffix('.toml.bak')})")
     else:
-        uv_toml.write_text(uv_content)
-        print(f"  uv:  configured")
+        uv_toml.write_text(uv_line + "\n")
+        print("  uv:  configured")
 
     # npm — preserve existing entries (like scoped registries)
     npmrc = pathlib.Path("~/.npmrc").expanduser()
