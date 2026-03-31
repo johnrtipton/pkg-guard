@@ -85,6 +85,7 @@ class Allowlist:
         self.path = pathlib.Path(path)
         self._entries: set[str] = set()
         self._lowered: set[str] = set()
+        self._prefixes: set[str] = set()  # e.g. "@aws-sdk/" from "@aws-sdk/*"
         self._mtime: float = 0
         self._lock = threading.Lock()
         self._load()
@@ -100,6 +101,10 @@ class Allowlist:
                         if line.strip()
                     }
                     self._lowered = {e.lower() for e in self._entries}
+                    # Entries ending with /* are scope prefixes
+                    self._prefixes = {
+                        e[:-1] for e in self._lowered if e.endswith("/*")
+                    }
                     self._mtime = mtime
         except OSError:
             pass
@@ -107,7 +112,10 @@ class Allowlist:
     def __contains__(self, pkg: str) -> bool:
         with self._lock:
             self._load()  # Auto-reload if file changed
-            return pkg.lower() in self._lowered
+            low = pkg.lower()
+            if low in self._lowered:
+                return True
+            return any(low.startswith(p) for p in self._prefixes)
 
     def add(self, pkg: str):
         with self._lock:
@@ -639,6 +647,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # PyPI Simple API index: /pypi/simple/ — reject, don't proxy the 38MB index
         if path == "/pypi/simple":
             self._respond(400, "text/plain", b"Package name required", head_only)
+            return
+
+        # npm tarball passthrough: /npm/{package}/-/{tarball}.tgz
+        npm_tgz_match = re.match(r"^/npm/(.+?/-/.+\.tgz)$", self.path)
+        if npm_tgz_match:
+            tgz_path = npm_tgz_match.group(1)
+            upstream_url = f"https://registry.npmjs.org/{tgz_path}"
+            try:
+                body, headers = fetch_url(upstream_url)
+                ct = headers.get("Content-Type", "application/octet-stream")
+                self._respond(200, ct, body, head_only)
+            except urllib.error.HTTPError as e:
+                self._respond(e.code, "text/plain", e.read(), head_only)
+            except Exception:
+                self._respond(502, "text/plain", b"Proxy error", head_only)
             return
 
         # npm registry: /npm/{package} or /npm/@scope/package
