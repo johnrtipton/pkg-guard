@@ -17,6 +17,7 @@ Usage:
     pkg-guard check <pkg>    Check a PyPI package's age
     pkg-guard setup          Configure pip/uv/npm to use the proxy
     pkg-guard unsetup        Remove proxy config from pip/uv/npm
+    pkg-guard normalize-lock [path]  Replace proxy registry URLs in uv.lock with pypi.org
 """
 
 import argparse
@@ -901,7 +902,7 @@ def cmd_setup(cfg: dict):
     port = cfg["server"]["port"]
     proxy_url = f"http://{host}:{port}"
 
-    # pip — merge with existing config
+    # pip
     pip_conf = pathlib.Path("~/.config/pip/pip.conf").expanduser()
     pip_conf.parent.mkdir(parents=True, exist_ok=True)
     pip_lines = [
@@ -914,40 +915,37 @@ def cmd_setup(cfg: dict):
             print("  pip: already configured")
         else:
             shutil.copy2(pip_conf, pip_conf.with_suffix(".conf.bak"))
-            # Remove existing index-url/trusted-host lines, preserve everything else
             lines = existing.splitlines()
-            filtered = [l for l in lines if not re.match(r"^\s*(index-url|trusted-host)\s*=", l)]
-            # Ensure [global] section exists
+            filtered = [l for l in lines if not re.match(r"^\s*(index-url|trusted-host|proxy)\s*=", l)]
             if not any(re.match(r"^\[global\]", l) for l in filtered):
                 filtered.insert(0, "[global]")
-            # Insert our lines after [global]
             idx = next(i for i, l in enumerate(filtered) if re.match(r"^\[global\]", l))
             for j, line in enumerate(pip_lines):
                 filtered.insert(idx + 1 + j, line)
             pip_conf.write_text("\n".join(filtered) + "\n")
-            print(f"  pip: configured (backed up original to {pip_conf.with_suffix('.conf.bak')})")
+            print(f"  pip: configured (backed up to {pip_conf.with_suffix('.conf.bak')})")
     else:
         pip_conf.write_text("[global]\n" + "\n".join(pip_lines) + "\n")
         print("  pip: configured")
 
-    # uv — merge with existing config
+    # uv — index-url (uv has no proxy setting; lock files are normalized via normalize-lock)
     uv_toml = pathlib.Path("~/.config/uv/uv.toml").expanduser()
     uv_toml.parent.mkdir(parents=True, exist_ok=True)
-    uv_line = f'index-url = "{proxy_url}/pypi/simple/"'
+    uv_index_line = f'index-url = "{proxy_url}/pypi/simple/"'
     if uv_toml.exists():
         existing = uv_toml.read_text()
         if proxy_url in existing:
             print("  uv:  already configured")
         else:
             shutil.copy2(uv_toml, uv_toml.with_suffix(".toml.bak"))
-            # Remove existing index-url, preserve everything else
-            lines = [l for l in existing.splitlines() if not re.match(r"^\s*index-url\s*=", l)]
-            lines.insert(0, uv_line)
+            lines = [l for l in existing.splitlines() if not re.match(r"^\s*(index-url|proxy)\s*=", l)]
+            lines.insert(0, uv_index_line)
             uv_toml.write_text("\n".join(lines) + "\n")
-            print(f"  uv:  configured (backed up original to {uv_toml.with_suffix('.toml.bak')})")
+            print(f"  uv:  configured (backed up to {uv_toml.with_suffix('.toml.bak')})")
     else:
-        uv_toml.write_text(uv_line + "\n")
+        uv_toml.write_text(uv_index_line + "\n")
         print("  uv:  configured")
+    print("       Note: uv.lock files are normalized via normalize-lock / git pre-commit hook")
 
     # npm — preserve existing entries (like scoped registries)
     npmrc = pathlib.Path("~/.npmrc").expanduser()
@@ -968,6 +966,9 @@ def cmd_setup(cfg: dict):
         npmrc.write_text(registry_line + "\n")
         print(f"  npm: configured")
 
+    # Global git pre-commit hook — normalize uv.lock files before every commit
+    _install_global_git_hook()
+
     print(f"\n\033[0;32m✓ All package managers configured to use proxy at {proxy_url}\033[0m")
 
 
@@ -977,7 +978,7 @@ def cmd_unsetup(cfg: dict):
     port = cfg["server"]["port"]
     proxy_url = f"http://{host}:{port}"
 
-    # pip — restore backup or remove
+    # pip — restore backup or strip proxy line
     pip_conf = pathlib.Path("~/.config/pip/pip.conf").expanduser()
     pip_bak = pip_conf.with_suffix(".conf.bak")
     if pip_conf.exists() and proxy_url in pip_conf.read_text():
@@ -990,7 +991,7 @@ def cmd_unsetup(cfg: dict):
     else:
         print("  pip: not configured (no change)")
 
-    # uv — restore backup or remove
+    # uv — restore backup or strip proxy line
     uv_toml = pathlib.Path("~/.config/uv/uv.toml").expanduser()
     uv_bak = uv_toml.with_suffix(".toml.bak")
     if uv_toml.exists() and proxy_url in uv_toml.read_text():
@@ -1019,6 +1020,22 @@ def cmd_unsetup(cfg: dict):
             print("  npm: not configured (no change)")
     else:
         print("  npm: not configured (no change)")
+
+    # Global git hook
+    hook_path = _GLOBAL_HOOKS_DIR / "pre-commit"
+    if hook_path.exists() and _HOOK_MARKER in hook_path.read_text():
+        hook_path.unlink()
+        print("  git:  global pre-commit hook removed")
+        # If our hooks dir is now empty, unset core.hooksPath
+        remaining = list(_GLOBAL_HOOKS_DIR.iterdir())
+        if not remaining:
+            subprocess.run(
+                ["git", "config", "--global", "--unset", "core.hooksPath"],
+                capture_output=True,
+            )
+            print("        core.hooksPath unset")
+    else:
+        print("  git:  global hook not installed (no change)")
 
     print(f"\n\033[0;32m✓ Proxy config removed\033[0m")
 
@@ -1099,6 +1116,124 @@ def cmd_check(cfg: dict, pkg: str):
 
 
 # ---------------------------------------------------------------------------
+# normalize-lock: rewrite proxy registry URLs to canonical pypi.org
+# ---------------------------------------------------------------------------
+
+CANONICAL_PYPI = "https://pypi.org/simple"
+
+_HOOK_MARKER = "# pkg-guard normalize-lock"
+_HOOK_BODY = """\
+#!/bin/sh
+{marker}
+if command -v pkg-guard >/dev/null 2>&1; then
+  staged=$(git diff --cached --name-only | grep -E '(^|/)uv\\.lock$')
+  if [ -n "$staged" ]; then
+    for f in $staged; do
+      pkg-guard normalize-lock "$f" && git add "$f"
+    done
+  fi
+fi
+""".format(marker=_HOOK_MARKER)
+
+_GLOBAL_HOOKS_DIR = pathlib.Path("~/.config/pkg-guard/git-hooks").expanduser()
+
+
+def normalize_lock_file(path: pathlib.Path, proxy_url: str) -> bool:
+    """Replace proxy registry URLs with pypi.org in a uv.lock file.
+
+    Returns True if the file was modified.
+    """
+    proxy_simple = proxy_url.rstrip("/") + "/pypi/simple/"
+    text = path.read_text()
+    # Match both with and without trailing slash
+    patterns = [
+        proxy_simple,
+        proxy_simple.rstrip("/"),
+    ]
+    modified = text
+    for pat in patterns:
+        modified = modified.replace(f'registry = "{pat}"', f'registry = "{CANONICAL_PYPI}"')
+        modified = modified.replace(f"registry = '{pat}'", f"registry = '{CANONICAL_PYPI}'")
+    if modified != text:
+        path.write_text(modified)
+        return True
+    return False
+
+
+def cmd_normalize_lock(cfg: dict, paths: list[str]):
+    """Replace proxy URLs in uv.lock files with https://pypi.org/simple."""
+    host = cfg["server"]["host"]
+    port = cfg["server"]["port"]
+    proxy_url = f"http://{host}:{port}"
+
+    targets: list[pathlib.Path] = []
+    if paths:
+        for p in paths:
+            resolved = pathlib.Path(p).expanduser().resolve()
+            if resolved.is_file():
+                targets.append(resolved)
+            elif resolved.is_dir():
+                targets.extend(resolved.rglob("uv.lock"))
+            else:
+                print(f"  \033[0;31m✗ Not found: {p}\033[0m")
+    else:
+        # Default: find all uv.lock files in current git repo
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, check=True,
+            )
+            root = pathlib.Path(result.stdout.strip())
+            targets = list(root.rglob("uv.lock"))
+        except subprocess.CalledProcessError:
+            targets = list(pathlib.Path.cwd().rglob("uv.lock"))
+
+    if not targets:
+        print("  No uv.lock files found.")
+        return
+
+    changed = 0
+    for t in targets:
+        if normalize_lock_file(t, proxy_url):
+            print(f"  \033[0;32m✓ Normalized\033[0m {t}")
+            changed += 1
+        else:
+            print(f"  · Already clean: {t}")
+    if changed:
+        print(f"\n\033[0;32m✓ Normalized {changed} file(s)\033[0m")
+
+
+def _install_global_git_hook():
+    """Install a global pre-commit hook via git core.hooksPath."""
+    _GLOBAL_HOOKS_DIR.mkdir(parents=True, exist_ok=True)
+    hook_path = _GLOBAL_HOOKS_DIR / "pre-commit"
+
+    if hook_path.exists() and _HOOK_MARKER in hook_path.read_text():
+        return  # Already installed
+
+    hook_path.write_text(_HOOK_BODY)
+    hook_path.chmod(0o755)
+
+    # Point git's global config at our hooks dir (preserving any existing value)
+    existing = subprocess.run(
+        ["git", "config", "--global", "core.hooksPath"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    if existing and existing != str(_GLOBAL_HOOKS_DIR):
+        # Another global hooks dir exists — warn rather than clobber
+        print(f"  \033[0;33m⚠  git core.hooksPath already set to {existing}\033[0m")
+        print(f"     Add to that directory manually: {hook_path}")
+    else:
+        subprocess.run(
+            ["git", "config", "--global", "core.hooksPath", str(_GLOBAL_HOOKS_DIR)],
+            check=True,
+        )
+        print(f"  git:  global pre-commit hook installed ({hook_path})")
+        print(f"        core.hooksPath → {_GLOBAL_HOOKS_DIR}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1127,6 +1262,9 @@ def main():
     p_check = sub.add_parser("check", help="Check a package's version age")
     p_check.add_argument("package")
 
+    p_norm = sub.add_parser("normalize-lock", help="Replace proxy URLs in uv.lock with pypi.org")
+    p_norm.add_argument("paths", nargs="*", help="Files or directories to normalize (default: entire git repo)")
+
     args = parser.parse_args()
     cfg = load_config()
 
@@ -1151,6 +1289,8 @@ def main():
             cmd_deny(cfg, args.package)
         case "check":
             cmd_check(cfg, args.package)
+        case "normalize-lock":
+            cmd_normalize_lock(cfg, args.paths)
         case _:
             parser.print_help()
 
