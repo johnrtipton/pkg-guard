@@ -1021,11 +1021,15 @@ def cmd_unsetup(cfg: dict):
     else:
         print("  npm: not configured (no change)")
 
-    # Global git hook
-    hook_path = _GLOBAL_HOOKS_DIR / "pre-commit"
-    if hook_path.exists() and _HOOK_MARKER in hook_path.read_text():
-        hook_path.unlink()
-        print("  git:  global pre-commit hook removed")
+    # Global git hooks
+    removed = []
+    for name in _HOOK_NAMES:
+        hook_path = _GLOBAL_HOOKS_DIR / name
+        if hook_path.exists() and _HOOK_MARKER in hook_path.read_text():
+            hook_path.unlink()
+            removed.append(name)
+    if removed:
+        print(f"  git:  global hooks removed ({', '.join(removed)})")
         # If our hooks dir is now empty, unset core.hooksPath
         remaining = list(_GLOBAL_HOOKS_DIR.iterdir())
         if not remaining:
@@ -1122,18 +1126,106 @@ def cmd_check(cfg: dict, pkg: str):
 CANONICAL_PYPI = "https://pypi.org/simple"
 
 _HOOK_MARKER = "# pkg-guard normalize-lock"
-_HOOK_BODY = """\
-#!/bin/sh
-{marker}
-if command -v pkg-guard >/dev/null 2>&1; then
-  staged=$(git diff --cached --name-only | grep -E '(^|/)uv\\.lock$')
-  if [ -n "$staged" ]; then
-    for f in $staged; do
-      pkg-guard normalize-lock "$f" && git add "$f"
-    done
-  fi
+# A global core.hooksPath makes git ignore every repo's own .git/hooks (and makes
+# `pre-commit install` refuse to run), so the same dispatcher is installed under
+# each hook name and chains to the repo's hooks after doing pkg-guard's own work.
+_HOOK_NAMES = (
+    "pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "pre-merge-commit",
+    "pre-rebase", "post-checkout", "post-merge", "pre-push", "post-rewrite",
+)
+_HOOK_BODY = r"""#!/bin/sh
+# pkg-guard normalize-lock
+# pkg-guard hook-dispatch v1 — installed under every hook name in the global
+# core.hooksPath. In order:
+#   1. pre-commit only: normalize staged uv.lock files
+#   2. Git LFS hooks, for repos that use LFS
+#   3. the repo's own hook: .git/hooks/<name> if present, else the repo's
+#      pre-commit / lefthook config directly
+hook=$(basename "$0")
+
+# pre-push and post-rewrite get data on stdin; buffer it so every step can read it.
+stdin_file=
+case "$hook" in
+  pre-push|post-rewrite)
+    stdin_file=$(mktemp "${TMPDIR:-/tmp}/pkg-guard-hook.XXXXXX") || exit 1
+    trap 'rm -f "$stdin_file"' EXIT
+    cat > "$stdin_file"
+    ;;
+esac
+feed() {
+  if [ -n "$stdin_file" ]; then "$@" < "$stdin_file"; else "$@"; fi
+}
+
+git_dir=$(git rev-parse --git-common-dir 2>/dev/null) || exit 0
+top=$(git rev-parse --show-toplevel 2>/dev/null)
+
+# 1. pkg-guard: rewrite proxy URLs in staged uv.lock files
+if [ "$hook" = pre-commit ] && command -v pkg-guard >/dev/null 2>&1; then
+  staged=$(git diff --cached --name-only | grep -E '(^|/)uv\.lock$')
+  for f in $staged; do
+    pkg-guard normalize-lock "$f" && git add "$f"
+  done
 fi
-""".format(marker=_HOOK_MARKER)
+
+# 2. Git LFS
+ran_lfs=
+case "$hook" in
+  pre-push|post-checkout|post-commit|post-merge)
+    if [ -d "$git_dir/lfs" ] || grep -qs 'filter=lfs' "$top/.gitattributes"; then
+      if command -v git-lfs >/dev/null 2>&1; then
+        feed git lfs "$hook" "$@" || exit $?
+        ran_lfs=1
+      else
+        echo >&2 "pkg-guard hook: repo uses Git LFS but git-lfs is not on PATH"
+        [ "$hook" = pre-push ] && exit 2
+      fi
+    fi
+    ;;
+esac
+
+# 3. The repo's own hook
+local_hook="$git_dir/hooks/$hook"
+if [ "$(cd "$(dirname "$0")" && pwd -P)" = "$(cd "$git_dir/hooks" 2>/dev/null && pwd -P)" ]; then
+  local_hook=  # repo points at this same dir; don't recurse
+fi
+if [ -n "$local_hook" ] && [ -x "$local_hook" ]; then
+  # Stock LFS hooks (nothing but LFS lines) were already handled in step 2.
+  # (Not `grep -qv`: BSD grep returns the wrong status when -q and -v are combined.)
+  if [ -n "$ran_lfs" ] && grep -qs 'configured for Git LFS' "$local_hook" &&
+     ! grep -v -e 'git lfs' -e 'git-lfs' -e '^#!' -e '^$' "$local_hook" 2>/dev/null | grep -q .; then
+    exit 0
+  fi
+  feed "$local_hook" "$@"
+  exit $?
+fi
+[ -n "$top" ] || exit 0
+
+for cfg in .pre-commit-config.yaml .pre-commit-config.yml; do
+  [ -f "$top/$cfg" ] || continue
+  if [ "$hook" = pre-commit ] || grep -qs -- "$hook" "$top/$cfg"; then
+    if command -v pre-commit >/dev/null 2>&1; then
+      feed pre-commit hook-impl --config="$top/$cfg" --hook-type="$hook" \
+        --hook-dir="$git_dir/hooks" --skip-on-missing-config -- "$@" || exit $?
+    else
+      echo >&2 "pkg-guard hook: $cfg exists but pre-commit is not installed; skipping"
+    fi
+  fi
+  break
+done
+
+for cfg in lefthook.yml lefthook.yaml .lefthook.yml .lefthook.yaml; do
+  [ -f "$top/$cfg" ] || continue
+  if grep -qs "^$hook:" "$top/$cfg"; then
+    if command -v lefthook >/dev/null 2>&1; then
+      feed lefthook run "$hook" "$@" || exit $?
+    else
+      echo >&2 "pkg-guard hook: $cfg exists but lefthook is not installed; skipping"
+    fi
+  fi
+  break
+done
+exit 0
+"""
 
 _GLOBAL_HOOKS_DIR = pathlib.Path("~/.config/pkg-guard/git-hooks").expanduser()
 
@@ -1204,15 +1296,30 @@ def cmd_normalize_lock(cfg: dict, paths: list[str]):
 
 
 def _install_global_git_hook():
-    """Install a global pre-commit hook via git core.hooksPath."""
+    """Install the global hook dispatcher via git core.hooksPath.
+
+    Writes the same dispatcher under every name in _HOOK_NAMES so per-repo hooks
+    keep running. Upgrades our own older hooks; never overwrites foreign ones.
+    """
     _GLOBAL_HOOKS_DIR.mkdir(parents=True, exist_ok=True)
+    changed = []
+    for name in _HOOK_NAMES:
+        hook_path = _GLOBAL_HOOKS_DIR / name
+        if hook_path.exists():
+            current = hook_path.read_text()
+            if _HOOK_MARKER not in current:
+                print(f"  \033[0;33m⚠  {hook_path} isn't a pkg-guard hook — left as is; "
+                      f"per-repo {name} hooks won't run\033[0m")
+                continue
+            if current == _HOOK_BODY:
+                continue
+        hook_path.write_text(_HOOK_BODY)
+        hook_path.chmod(0o755)
+        changed.append(name)
+
+    if not changed:
+        return  # Already installed and current
     hook_path = _GLOBAL_HOOKS_DIR / "pre-commit"
-
-    if hook_path.exists() and _HOOK_MARKER in hook_path.read_text():
-        return  # Already installed
-
-    hook_path.write_text(_HOOK_BODY)
-    hook_path.chmod(0o755)
 
     # Point git's global config at our hooks dir (preserving any existing value)
     existing = subprocess.run(
@@ -1229,8 +1336,8 @@ def _install_global_git_hook():
             ["git", "config", "--global", "core.hooksPath", str(_GLOBAL_HOOKS_DIR)],
             check=True,
         )
-        print(f"  git:  global pre-commit hook installed ({hook_path})")
-        print(f"        core.hooksPath → {_GLOBAL_HOOKS_DIR}")
+        print(f"  git:  global hooks installed/updated ({', '.join(changed)})")
+        print(f"        core.hooksPath → {_GLOBAL_HOOKS_DIR} (chains to each repo's own hooks)")
 
 
 # ---------------------------------------------------------------------------

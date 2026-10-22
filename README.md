@@ -70,6 +70,18 @@ log = "~/.local/share/pkg-guard/guard.log"
 
 This means cron jobs, CI scripts, and subprocess-spawned installs all go through the proxy without needing environment variables.
 
+### Global git hooks
+
+`setup` also sets the global `core.hooksPath` to `~/.config/pkg-guard/git-hooks` so staged `uv.lock` files get proxy URLs rewritten to pypi.org before every commit.
+
+A global `core.hooksPath` makes git ignore every repo's own `.git/hooks` (and `pre-commit install` refuses to run), so the same dispatcher is installed under every hook name. On each hook it:
+
+1. `pre-commit` only: normalizes staged `uv.lock` files
+2. runs Git LFS hooks, for repos that use LFS
+3. runs the repo's own hook — `.git/hooks/<name>` if present, otherwise the repo's `.pre-commit-config.yaml` (via `pre-commit hook-impl`) or `lefthook.yml` directly
+
+Repos that set their own local `core.hooksPath` (e.g. husky) are unaffected — local config wins. `unsetup` removes only hooks carrying the pkg-guard marker.
+
 ## What's protected
 
 | Tool | Protected | Notes |
